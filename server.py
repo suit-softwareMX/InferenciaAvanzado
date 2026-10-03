@@ -250,7 +250,19 @@ def process_one(store, engine):
         model = status.get(job["task"], {}).get("active")
         if model:
             store.set_model(job["id"], model)
-        result = validate_result(job["task"], engine.run(job["task"], data, job["project"], model) if model else engine.run(job["task"], data, job["project"]), data["fields"].keys())
+        result = None
+        last_error = None
+        for _attempt in range(2):
+            try:
+                candidate = engine.run(job["task"], data, job["project"], model) if model else engine.run(job["task"], data, job["project"])
+                result = validate_result(job["task"], candidate, data["fields"].keys())
+                break
+            except ValueError as exc:
+                last_error = exc
+                if str(exc) != "invalid_model_output":
+                    raise
+        if result is None:
+            raise last_error or ValueError("invalid_model_output")
         store.finish(job["id"], result=result, model=model)
         status = "succeeded"
     except Exception as exc:

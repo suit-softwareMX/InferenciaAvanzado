@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from server import Ollama, Store, create_app, process_one
+from server import Ollama, Store, create_app, process_one, wrong_translation_language
 
 
 class FakeEngine:
@@ -16,6 +16,8 @@ class FakeEngine:
 
     def run(self, task, data, project):
         if task == "translate":
+            if data["source_locale"] == "en":
+                return {"fields": {key: "Auditoría financiera" for key in data["fields"]}}
             return {"fields": {key: f"EN: {value}" for key, value in data["fields"].items()}}
         if task == "proofread":
             return {"fields": data["fields"]}
@@ -101,6 +103,35 @@ class GatewayTests(unittest.TestCase):
             result = engine.run("detect_language", {"fields": {"field": "Confidence beyond borders."}}, "auditaxes")
         self.assertEqual(result, {"locale": "en"})
         self.assertEqual(json.loads(send.call_args.args[0].data)["model"], "test-model")
+
+    def test_translation_retries_wrong_language_in_both_directions(self):
+        cases = [
+            ("en", "es", "Confidence beyond borders", "Confianza más allá de las fronteras"),
+            ("es", "en", "Confianza que trasciende fronteras", "Confidence beyond borders"),
+        ]
+        for source, target, original, translated in cases:
+            with self.subTest(source=source):
+                self.assertTrue(wrong_translation_language(original, original, source, target))
+                self.assertFalse(wrong_translation_language(original, translated, source, target))
+                job = self.client.post("/v1/jobs", headers=self.headers, json={"task": "translate", "input": {
+                    "source_locale": source, "target_locale": target, "fields": {"title": original},
+                }}).json()
+                engine = Ollama("http://127.0.0.1:11434", {"translate": "test-model"})
+                with patch.object(engine, "model_status", return_value={"translate": {"active": "test-model"}}), \
+                     patch.object(engine, "run", side_effect=[{"fields": {"title": original}}, {"fields": {"title": translated}}]) as run:
+                    self.assertTrue(process_one(self.store, engine))
+                    self.assertTrue(run.call_args.kwargs["retry"])
+                done = self.client.get(f"/v1/jobs/{job['id']}", headers=self.headers).json()
+                self.assertEqual(done["result"]["fields"]["title"], translated)
+
+    def test_ollama_prompt_names_the_target_language(self):
+        engine = Ollama("http://127.0.0.1:11434", {"translate": "test-model"})
+        for source, target, expected in (("en", "es", "Spanish"), ("es", "en", "English")):
+            response = io.BytesIO(json.dumps({"message": {"content": '{"fields":{"title":"Texto"}}'}}).encode())
+            with patch("server.urllib.request.urlopen", return_value=response) as send:
+                engine.run("translate", {"source_locale": source, "target_locale": target, "fields": {"title": "Texto"}}, "auditaxes")
+            prompt = json.loads(send.call_args.args[0].data)["messages"][0]["content"]
+            self.assertIn(f"into {expected}", prompt)
 
     def test_preferred_model_fallback_and_health(self):
         engine = Ollama("http://127.0.0.1:11434", {task: "small" for task in ("translate", "review", "proofread", "detect_language")},

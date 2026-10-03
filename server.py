@@ -2,6 +2,7 @@
 
 import hmac
 import json
+import re
 import logging
 import os
 import sqlite3
@@ -107,6 +108,19 @@ def validate_result(task, result, field_ids):
     return result
 
 
+def wrong_translation_language(source, translated, source_locale, target_locale):
+    # Only reject clear source-language output; short names and mixed text remain for human review.
+    markers = {
+        "en": {"the", "and", "with", "from", "your", "our", "beyond", "borders", "confidence", "organization", "services", "financial", "audit"},
+        "es": {"el", "la", "los", "las", "que", "con", "para", "desde", "nuestra", "más", "confianza", "fronteras", "organización", "servicios", "financiera", "auditoría"},
+    }
+    words = set(re.findall(r"\b[^\W\d_]+\b", translated.casefold()))
+    source_words = set(re.findall(r"\b[^\W\d_]+\b", source.casefold()))
+    return (len(source_words & markers[source_locale]) >= 2 and
+            len(words & markers[source_locale]) >= 2 and
+            not words & markers[target_locale])
+
+
 class Store:
     def __init__(self, filename):
         self.filename = Path(filename)
@@ -209,9 +223,16 @@ class Ollama:
         except (OSError, TimeoutError, KeyError, ValueError):
             return False
 
-    def run(self, task, data, project, model=None):
+    def run(self, task, data, project, model=None, retry=False):
         if task == "translate":
-            instruction = f"Translate each field from {data['source_locale']} to {data['target_locale']} naturally. Preserve field IDs, meaning, names, numbers, contact details and claims. Return only JSON."
+            source_name = {"es": "Spanish", "en": "English"}[data["source_locale"]]
+            target_name = {"es": "Spanish", "en": "English"}[data["target_locale"]]
+            instruction = (f"Translate every text value from {source_name} ({data['source_locale']}) into {target_name} ({data['target_locale']}). "
+                           f"The value of each output field MUST be written in {target_name}, never copied in {source_name}, except proper names and brand names. "
+                           "Keep exactly the same field IDs. Preserve meaning, numbers, contact details and claims. "
+                           "Do not translate the JSON keys or add commentary. Return only JSON.")
+            if retry:
+                instruction += f" Previous output was invalid or remained in {source_name}. Correct it now: ALL prose must be in {target_name}."
         elif task == "proofread":
             instruction = f"Correct spelling, punctuation and clear grammar in {data['source_locale']}. Preserve field IDs, meaning, names, numbers, links and tone. Make no stylistic rewrites. Return the corrected complete fields as JSON."
         elif task == "detect_language":
@@ -252,10 +273,16 @@ def process_one(store, engine):
             store.set_model(job["id"], model)
         result = None
         last_error = None
-        for _attempt in range(2):
+        for attempt in range(2):
             try:
-                candidate = engine.run(job["task"], data, job["project"], model) if model else engine.run(job["task"], data, job["project"])
+                if isinstance(engine, Ollama):
+                    candidate = engine.run(job["task"], data, job["project"], model, retry=attempt > 0)
+                else:
+                    candidate = engine.run(job["task"], data, job["project"])
                 result = validate_result(job["task"], candidate, data["fields"].keys())
+                if job["task"] == "translate" and any(wrong_translation_language(data["fields"][key], value, data["source_locale"], data["target_locale"])
+                                                          for key, value in result["fields"].items()):
+                    raise ValueError("invalid_model_output")
                 break
             except ValueError as exc:
                 last_error = exc
